@@ -34,6 +34,9 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Your choice is remembered for the next session. The first time, `autumn-maple` is applied.
 
+**Sync between conversations / 對話之間同步：** every open conversation looks at one small file (`~/.claude/custom-theme-current.txt`) every 3 seconds, so a switch in one conversation reaches the others within seconds. It reads a tiny file and calls no model, so it uses no tokens.
+每個開著的對話每 3 秒讀一次這個小檔案，所以在一個對話切換後，其他對話幾秒內會跟著換。它只讀一個小檔案，不會呼叫模型，不消耗 token。
+
 ## Themes / 主題
 
 | id | 名稱 | Mode | Background |

@@ -5,7 +5,17 @@ import type { ThemeDef } from './themes.js'
 
 const DEFAULT_ID = 'autumn-maple'
 
-type ThemeApi = { theme: { set: (args: ThemeSetArgs) => Promise<ThemeResult> } }
+// How often each open conversation looks at the shared choice. It reads one tiny file and calls
+// no model, so it costs no tokens.
+const POLL_MS = 3000
+
+type Api = {
+  theme: { set: (args: ThemeSetArgs) => Promise<ThemeResult>; clear: () => Promise<ThemeResult> }
+  fs: { read: (path: string) => Promise<unknown>; write: (path: string, text: string) => Promise<void> }
+  env: { get: (name: string) => Promise<string | undefined> }
+  store: { get: (key: string) => Promise<unknown>; set: (key: string, value: unknown) => Promise<void> }
+  ui: { toast: (text: string) => unknown; status: (text: string | undefined) => unknown }
+}
 
 function look(t: ThemeDef): ThemeSetArgs {
   if (t.scene === undefined) {
@@ -13,10 +23,6 @@ function look(t: ThemeDef): ThemeSetArgs {
   }
 
   return { colors: t.colors, backdrop: { scene: t.id, glass: t.glass ?? false } }
-}
-
-async function apply($: ThemeApi, t: ThemeDef): Promise<ThemeResult> {
-  return $.theme.set(look(t))
 }
 
 function find(arg: string): ThemeDef | undefined {
@@ -37,6 +43,45 @@ function find(arg: string): ThemeDef | undefined {
   const partial = THEMES.filter(t => t.id.includes(q) || t.name.includes(arg.trim()))
 
   return partial.length === 1 ? partial[0] : undefined
+}
+
+// The choice every conversation shares: one small file, so a switch in one conversation reaches the others.
+async function sharedPath($: Api): Promise<string | undefined> {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+
+  return home === undefined || home === '' ? undefined : `${home.replace(/[\\/]$/, '')}/.claude/custom-theme-current.txt`
+}
+
+async function readChoice($: Api): Promise<string | undefined> {
+  const path = await sharedPath($)
+
+  if (path !== undefined) {
+    try {
+      const text = String(await $.fs.read(path)).trim()
+
+      if (text !== '') {
+        return text
+      }
+    } catch {
+      // No file yet: fall back to this mod's own store below.
+    }
+  }
+  const saved = await $.store.get('current')
+
+  return typeof saved === 'string' ? saved : undefined
+}
+
+async function writeChoice($: Api, id: string): Promise<void> {
+  await $.store.set('current', id)
+  const path = await sharedPath($)
+
+  if (path !== undefined) {
+    try {
+      await $.fs.write(path, `${id}\n`)
+    } catch {
+      // The store still holds it for this conversation.
+    }
+  }
 }
 
 function listText(currentId: string | undefined): string {
@@ -60,42 +105,65 @@ function listText(currentId: string | undefined): string {
     '  /custom-theme next         下一個主題',
     '  /custom-theme off          關閉，回到 app 原本的樣子',
     '  /custom-theme list         顯示這份清單',
+    '',
+    '切換後，其他開著的對話會在幾秒內自動跟著換。',
   ].join('\n')
 }
 
 export const register: Register = on => {
+  // What this conversation is showing now. It starts over when the mod reloads.
+  let applied: string | undefined
+
+  async function sync($: Api): Promise<void> {
+    const choice = (await readChoice($)) ?? DEFAULT_ID
+
+    if (choice === applied) {
+      return
+    }
+
+    if (choice === 'off') {
+      if (applied !== undefined) {
+        await $.theme.clear()
+      }
+      applied = 'off'
+
+      return
+    }
+    const t = find(choice) ?? find(DEFAULT_ID)
+
+    if (t === undefined) {
+      return
+    }
+    const unpainted = t.problems.find(line => line.startsWith("Desktop won't paint"))
+
+    if (unpainted !== undefined) {
+      $.ui.toast(unpainted)
+    }
+    const set = await $.theme.set(look(t))
+
+    applied = choice
+
+    if (!set.isDrawn) {
+      $.ui.status(`${t.id}: ${set.reason}`)
+    }
+  }
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'custom-theme',
-      description: '列出並切換自訂主題與動態背景',
+      description: '列出並切換自訂主題與動態背景（所有對話同步）',
       argumentHint: '[list | 編號 | 名稱 | next | off]',
     })
-    const saved = await $.store.get('current')
-
-    if (saved !== 'off') {
-      const t = find(typeof saved === 'string' ? saved : DEFAULT_ID) ?? find(DEFAULT_ID)
-
-      if (t !== undefined) {
-        const unpainted = t.problems.find(line => line.startsWith("Desktop won't paint"))
-
-        if (unpainted !== undefined) {
-          $.ui.toast(unpainted)
-        }
-        const set = await apply($, t)
-
-        if (!set.isDrawn) {
-          $.ui.status(`${t.id}: ${set.reason}`)
-        }
-      }
-    }
+    await sync($)
+    $.clock.every(POLL_MS, () => sync($).catch(() => undefined))
 
     return next(e)
   })
 
   on('command.run', { command: 'custom-theme' }, async ($, e) => {
     const arg = e.args.trim()
-    const saved = await $.store.get('current')
-    const currentId = typeof saved === 'string' && saved !== 'off' ? saved : saved === 'off' ? undefined : DEFAULT_ID
+    const saved = await readChoice($)
+    const currentId = saved === 'off' ? undefined : (saved ?? DEFAULT_ID)
 
     if (arg === '' || arg === 'list' || arg === 'ls') {
       return { text: listText(currentId) }
@@ -103,9 +171,10 @@ export const register: Register = on => {
 
     if (arg === 'off' || arg === 'clear') {
       await $.theme.clear()
-      await $.store.set('current', 'off')
+      await writeChoice($, 'off')
+      applied = 'off'
 
-      return { text: '已關閉自訂主題，回到 app 原本的樣子。要再開啟請輸入 /custom-theme 加上編號或名稱。' }
+      return { text: '已關閉自訂主題，回到 app 原本的樣子。其他開著的對話會在幾秒內跟著關閉。要再開啟請輸入 /custom-theme 加上編號或名稱。' }
     }
     let target: ThemeDef | undefined
 
@@ -121,9 +190,10 @@ export const register: Register = on => {
       return { text: `找不到「${arg}」。\n\n${listText(currentId)}` }
     }
     const unpainted = target.problems.find(line => line.startsWith("Desktop won't paint"))
-    const set = await apply($, target)
+    const set = await $.theme.set(look(target))
 
-    await $.store.set('current', target.id)
+    applied = target.id
+    await writeChoice($, target.id)
 
     if (!set.isDrawn) {
       $.ui.status(`${target.id}: ${set.reason}`)
@@ -134,7 +204,7 @@ export const register: Register = on => {
     }
     const warn = unpainted === undefined ? '' : `\n注意：${unpainted}`
 
-    return { text: `已切換到「${target.name}」：${target.description}${warn}` }
+    return { text: `已切換到「${target.name}」：${target.description}。其他開著的對話會在幾秒內跟著換。${warn}` }
   })
 
   on('ui.render', { component: 'Backdrop' }, ($, e, next) => {
