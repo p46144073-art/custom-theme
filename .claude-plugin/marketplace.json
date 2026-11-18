@@ -1,0 +1,11 @@
+{
+  "name": "custom-theme",
+  "owner": { "name": "p46144073-art" },
+  "plugins": [
+    {
+      "name": "custom-theme",
+      "source": "./",
+      "description": "/custom-theme: list and switch between animated backgrounds and color themes in the Claude desktop app"
+    }
+  ]
+}
